@@ -1,0 +1,19 @@
+[project]
+name = "skala"
+version = "0.1.0"
+description = "ELO rating system for rock climbing routes and climbers"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = [
+    "httpx>=0.27",
+    "beautifulsoup4>=4.12",
+    "click>=8.1",
+    "playwright>=1.50",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project.scripts]
+skala = "skala.cli:main"

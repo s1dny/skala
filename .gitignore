@@ -1,1 +1,7 @@
-climbers.pkl
+__pycache__/
+*.pyc
+*.db
+*.db-shm
+*.db-wal
+.venv/
+.DS_Store
