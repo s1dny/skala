@@ -30,10 +30,28 @@ def calculate_elos():
         conn.execute(f"UPDATE routes SET elo = {STARTING_ELO}, matches = 0")
         conn.commit()
 
-    # Load all ascents chronologically
+    # Load ascents, keeping only the best tick per climber-route pair.
+    # Rank: onsight > flash > everything else. Among ties, earliest wins.
     with console.status("[bold cyan]Loading ascents..."):
         ascents = conn.execute(
-            "SELECT climber, route_id, tick_type FROM ascents ORDER BY date ASC, id ASC"
+            """
+            SELECT climber, route_id, tick_type, date FROM (
+                SELECT *,
+                    ROW_NUMBER() OVER (
+                        PARTITION BY climber, route_id
+                        ORDER BY
+                            CASE tick_type
+                                WHEN 'onsight' THEN 0
+                                WHEN 'flash'   THEN 1
+                                ELSE 2
+                            END,
+                            date ASC, id ASC
+                    ) AS rn
+                FROM ascents
+            )
+            WHERE rn = 1
+            ORDER BY date ASC
+            """
         ).fetchall()
 
     if not ascents:
