@@ -79,7 +79,7 @@ def rankings(entity_type, limit):
 
     if entity_type == "climbers":
         rows = conn.execute(
-            "SELECT username, elo, matches FROM climbers WHERE matches > 0 ORDER BY elo DESC LIMIT ?",
+            "SELECT username, elo, rd, matches FROM climbers WHERE matches > 0 ORDER BY elo DESC LIMIT ?",
             (limit,),
         ).fetchall()
 
@@ -88,19 +88,19 @@ def rankings(entity_type, limit):
             conn.close()
             return
 
-        table = Table(title=f"Top {len(rows)} Climbers by ELO")
+        table = Table(title=f"Top {len(rows)} Climbers by Rating")
         table.add_column("Rank", style="dim", width=5, justify="right")
         table.add_column("Climber", style="bold cyan", max_width=30)
-        table.add_column("ELO", style="bold green", justify="right")
+        table.add_column("Rating", style="bold green", justify="right")
+        table.add_column("\u00b1RD", style="dim", justify="right")
         table.add_column("Matches", style="white", justify="right")
 
         for i, row in enumerate(rows, 1):
-            elo_str = f"{row['elo']:.1f}"
-            table.add_row(str(i), row["username"], elo_str, str(row["matches"]))
+            table.add_row(str(i), row["username"], f"{row['elo']:.0f}", f"{row['rd']:.0f}", str(row["matches"]))
 
     else:
         rows = conn.execute(
-            "SELECT route_id, name, grade, elo, matches FROM routes WHERE matches > 0 ORDER BY elo DESC LIMIT ?",
+            "SELECT route_id, name, grade, elo, rd, matches FROM routes WHERE matches > 0 ORDER BY elo DESC LIMIT ?",
             (limit,),
         ).fetchall()
 
@@ -109,18 +109,18 @@ def rankings(entity_type, limit):
             conn.close()
             return
 
-        table = Table(title=f"Top {len(rows)} Routes by ELO")
+        table = Table(title=f"Top {len(rows)} Routes by Rating")
         table.add_column("Rank", style="dim", width=5, justify="right")
         table.add_column("Route", style="bold cyan", max_width=35)
         table.add_column("Grade", style="yellow", width=8, justify="center")
-        table.add_column("ELO", style="bold green", justify="right")
+        table.add_column("Rating", style="bold green", justify="right")
+        table.add_column("\u00b1RD", style="dim", justify="right")
         table.add_column("Matches", style="white", justify="right")
 
         for i, row in enumerate(rows, 1):
             name = (row["name"] or "Unknown")[:33]
             grade = row["grade"] or "?"
-            elo_str = f"{row['elo']:.1f}"
-            table.add_row(str(i), name, grade, elo_str, str(row["matches"]))
+            table.add_row(str(i), name, grade, f"{row['elo']:.0f}", f"{row['rd']:.0f}", str(row["matches"]))
 
     console.print()
     console.print(table)

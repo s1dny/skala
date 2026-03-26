@@ -5,16 +5,20 @@ DB_PATH = Path("skala.db")
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS climbers (
-    username TEXT PRIMARY KEY,
-    elo      REAL DEFAULT 1000.0,
-    matches  INTEGER DEFAULT 0
+    username   TEXT PRIMARY KEY,
+    elo        REAL DEFAULT 1500.0,
+    rd         REAL DEFAULT 350.0,
+    volatility REAL DEFAULT 0.06,
+    matches    INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS routes (
     route_id   TEXT PRIMARY KEY,
     name       TEXT,
     grade      TEXT,
-    elo        REAL DEFAULT 1000.0,
+    elo        REAL DEFAULT 1500.0,
+    rd         REAL DEFAULT 350.0,
+    volatility REAL DEFAULT 0.06,
     matches    INTEGER DEFAULT 0
 );
 
@@ -36,12 +40,23 @@ CREATE TABLE IF NOT EXISTS scrape_progress (
 """
 
 
+def _migrate(conn: sqlite3.Connection):
+    """Add columns that may be missing from older databases."""
+    for table in ("climbers", "routes"):
+        existing = {row[1] for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+        if "rd" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN rd REAL DEFAULT 350.0")
+        if "volatility" not in existing:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN volatility REAL DEFAULT 0.06")
+
+
 def get_connection(db_path: Path = DB_PATH) -> sqlite3.Connection:
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA journal_mode=WAL")
     conn.execute("PRAGMA foreign_keys=ON")
     conn.executescript(SCHEMA)
+    _migrate(conn)
     return conn
 
 
