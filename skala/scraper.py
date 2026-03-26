@@ -6,13 +6,13 @@ Strategy:
   2. For each target crag, fetch /crags/{slug}/routelist → parse route table
   3. For each route with ascents, fetch route page + /more endpoint → parse ticks
   4. Climber list is built organically from ascent data
+
+Uses async httpx for high-concurrency I/O.
 """
 
+import asyncio
 import json
 import re
-import time
-import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from bs4 import BeautifulSoup
@@ -55,13 +55,10 @@ try:
     import lxml  # noqa: F401
     HTML_PARSER = "lxml"
 except ImportError:
-    HTML_PARSER = HTML_PARSER
-
-# Thread-local storage for per-thread HTTP clients
-_thread_local = threading.local()
+    HTML_PARSER = "html.parser"
 
 # Default concurrency for route scraping within a crag
-DEFAULT_WORKERS = 10
+DEFAULT_WORKERS = 64
 
 
 def _parse_grade_code(code: str) -> str | None:
@@ -87,8 +84,8 @@ def _parse_grade_code(code: str) -> str | None:
 # HTTP client
 # ---------------------------------------------------------------------------
 
-def _make_client() -> httpx.Client:
-    return httpx.Client(
+def _make_async_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
         headers=HEADERS,
         follow_redirects=True,
         timeout=30.0,
@@ -96,21 +93,43 @@ def _make_client() -> httpx.Client:
     )
 
 
-def _get_thread_client() -> httpx.Client:
-    """Get or create a per-thread HTTP client (for thread-pool workers)."""
-    if not hasattr(_thread_local, "client"):
-        _thread_local.client = _make_client()
-    return _thread_local.client
+def _make_client() -> httpx.Client:
+    return httpx.Client(
+        headers=HEADERS,
+        follow_redirects=True,
+        timeout=30.0,
+    )
+
+
+async def _aget(client: httpx.AsyncClient, url: str) -> httpx.Response:
+    """Async GET with basic retry."""
+    for attempt in range(3):
+        try:
+            resp = await client.get(url)
+            if resp.status_code == 200:
+                return resp
+            if resp.status_code == 429:
+                wait = 10 * (attempt + 1)
+                console.print(f"  [yellow]Rate limited, waiting {wait}s...[/yellow]")
+                await asyncio.sleep(wait)
+                continue
+            console.print(f"  [red]HTTP {resp.status_code}[/red] for {url}")
+            return resp
+        except httpx.RequestError as e:
+            console.print(f"  [red]Request error (attempt {attempt + 1}):[/red] {e}")
+            await asyncio.sleep(5)
+    raise RuntimeError(f"Failed to fetch {url} after 3 attempts")
 
 
 def _get(client: httpx.Client, url: str) -> httpx.Response:
-    """GET with basic retry."""
+    """Sync GET with basic retry (used for list_crags only)."""
     for attempt in range(3):
         try:
             resp = client.get(url)
             if resp.status_code == 200:
                 return resp
             if resp.status_code == 429:
+                import time
                 wait = 10 * (attempt + 1)
                 console.print(f"  [yellow]Rate limited, waiting {wait}s...[/yellow]")
                 time.sleep(wait)
@@ -119,6 +138,7 @@ def _get(client: httpx.Client, url: str) -> httpx.Response:
             return resp
         except httpx.RequestError as e:
             console.print(f"  [red]Request error (attempt {attempt + 1}):[/red] {e}")
+            import time
             time.sleep(5)
     raise RuntimeError(f"Failed to fetch {url} after 3 attempts")
 
@@ -184,12 +204,7 @@ def _name_to_slug(name: str) -> str:
 
 
 def _enrich_crags_with_slugs(crags: list[dict], page_html: str):
-    """Add param_id (URL slug) to crags from the embedded JSON.
-
-    Strategy: derive slug from name. Numeric IDs work as URLs but often
-    show a parent area with fewer routes. Text slugs get the full route list.
-    Falls back to numeric ID if the name produces an empty slug.
-    """
+    """Add param_id (URL slug) to crags from the embedded JSON."""
     for crag in crags:
         name = crag.get("name", "")
         slug = _name_to_slug(name)
@@ -224,18 +239,11 @@ def filter_crags(crags: list[dict], sort: str = "boulders") -> list[dict]:
 # Routes
 # ---------------------------------------------------------------------------
 
-def scrape_routelist(client: httpx.Client, crag_slug: str) -> list[dict]:
-    """Scrape the route list for a crag."""
-    url = f"{BASE_URL}/crags/{crag_slug}/routelist"
-    resp = _get(client, url)
-    if resp.status_code != 200:
-        console.print(f"  [red]Failed to fetch routelist for {crag_slug}[/red]")
-        return []
-
-    soup = BeautifulSoup(resp.text, HTML_PARSER)
+def _parse_routelist(html: str, crag_slug: str) -> list[dict]:
+    """Parse route list HTML into route dicts."""
+    soup = BeautifulSoup(html, HTML_PARSER)
     routes = []
 
-    # Route list table: columns are [name/info, grade_code, type, ascents, rating, ...]
     for row in soup.select("tr"):
         link = row.select_one('a[href*="/routes/"]')
         if not link:
@@ -255,9 +263,7 @@ def scrape_routelist(client: httpx.Client, crag_slug: str) -> list[dict]:
         ascent_count = 0
 
         if len(tds) >= 3:
-            # td[0] = grade code (e.g. "5006B"), td[1] = type, td[2] = ascent count
             grade_code = tds[0].get_text(strip=True)
-            # Extract display grade: strip leading numeric prefix (sort key)
             grade = _parse_grade_code(grade_code)
             route_type = tds[1].get_text(strip=True)
             try:
@@ -277,6 +283,16 @@ def scrape_routelist(client: httpx.Client, crag_slug: str) -> list[dict]:
     return routes
 
 
+async def scrape_routelist(client: httpx.AsyncClient, crag_slug: str) -> list[dict]:
+    """Scrape the route list for a crag."""
+    url = f"{BASE_URL}/crags/{crag_slug}/routelist"
+    resp = await _aget(client, url)
+    if resp.status_code != 200:
+        console.print(f"  [red]Failed to fetch routelist for {crag_slug}[/red]")
+        return []
+    return _parse_routelist(resp.text, crag_slug)
+
+
 # ---------------------------------------------------------------------------
 # Ascents
 # ---------------------------------------------------------------------------
@@ -289,10 +305,8 @@ def _parse_ascent_html(html: str, crag_slug: str, route_slug: str, route_name: s
     # Look for ascent rows — multiple possible structures
     rows = soup.select(".result-row, .ascent-row, .tick-row, tr.ascent, .ascent")
     if not rows:
-        # Try broader: any element with climber links and ascent type info
         rows = soup.select("[class*='ascent'], [class*='tick']")
     if not rows:
-        # Broadest: look for links to climber profiles within structured containers
         rows = soup.select("li, tr, .row")
 
     for row in rows:
@@ -315,7 +329,6 @@ def _parse_ascent_html(html: str, crag_slug: str, route_slug: str, route_name: s
             tick_type = TICK_TYPE_MAP.get(raw)
 
         if not tick_type:
-            # Check title attributes
             for el in row.select("[title]"):
                 title = el.get("title", "").strip().lower()
                 if title in TICK_TYPE_MAP:
@@ -323,7 +336,6 @@ def _parse_ascent_html(html: str, crag_slug: str, route_slug: str, route_name: s
                     break
 
         if not tick_type:
-            # Check text content for known tick types
             text = row.get_text(" ", strip=True).lower()
             for key in TICK_TYPE_MAP:
                 if key in text:
@@ -335,7 +347,6 @@ def _parse_ascent_html(html: str, crag_slug: str, route_slug: str, route_name: s
         date_el = row.select_one(".date, time, [class*='date']")
         if date_el:
             date = date_el.get_text(strip=True)
-            # Normalize date format
             if not re.match(r'\d{4}-\d{2}-\d{2}', date):
                 date = None
 
@@ -353,35 +364,44 @@ def _parse_ascent_html(html: str, crag_slug: str, route_slug: str, route_name: s
     return ascents
 
 
-def scrape_route_ascents(client: httpx.Client, crag_slug: str, route_slug: str,
-                         route_name: str, grade: str | None) -> list[dict]:
-    """Scrape all ascents for a single route."""
+async def scrape_route_ascents(client: httpx.AsyncClient, sem: asyncio.Semaphore,
+                               crag_slug: str, route_slug: str,
+                               route_name: str, grade: str | None,
+                               ascent_count: int) -> list[dict]:
+    """Scrape all ascents for a single route, fetching page and /more concurrently."""
     url = f"{BASE_URL}/crags/{crag_slug}/routes/{route_slug}"
-    resp = _get(client, url)
-    if resp.status_code != 200:
+
+    async with sem:
+        # Fire both requests concurrently
+        if ascent_count > 5:
+            page_resp, more_resp = await asyncio.gather(
+                _aget(client, url),
+                _aget(client, f"{url}/more"),
+                return_exceptions=True,
+            )
+        else:
+            # Few ascents — skip /more, it's unlikely to have extra data
+            page_resp = await _aget(client, url)
+            more_resp = None
+
+    if isinstance(page_resp, Exception) or page_resp.status_code != 200:
         return []
 
-    ascents = _parse_ascent_html(resp.text, crag_slug, route_slug, route_name, grade)
+    ascents = _parse_ascent_html(page_resp.text, crag_slug, route_slug, route_name, grade)
 
-    # Try the /more endpoint for additional ascents
-    more_url = f"{url}/more"
-    try:
-        more_resp = _get(client, more_url)
-        if more_resp.status_code == 200:
-            try:
-                data = more_resp.json()
-                ticks_html = data.get("ticks", "")
-                if ticks_html:
-                    more_ascents = _parse_ascent_html(ticks_html, crag_slug, route_slug, route_name, grade)
-                    # Merge, avoiding duplicates
-                    existing = {(a["username"], a["date"]) for a in ascents}
-                    for a in more_ascents:
-                        if (a["username"], a["date"]) not in existing:
-                            ascents.append(a)
-            except (json.JSONDecodeError, ValueError):
-                pass
-    except RuntimeError:
-        pass
+    # Merge /more results
+    if more_resp is not None and not isinstance(more_resp, Exception) and more_resp.status_code == 200:
+        try:
+            data = more_resp.json()
+            ticks_html = data.get("ticks", "")
+            if ticks_html:
+                more_ascents = _parse_ascent_html(ticks_html, crag_slug, route_slug, route_name, grade)
+                existing = {(a["username"], a["date"]) for a in ascents}
+                for a in more_ascents:
+                    if (a["username"], a["date"]) not in existing:
+                        ascents.append(a)
+        except (json.JSONDecodeError, ValueError):
+            pass
 
     return ascents
 
@@ -432,11 +452,11 @@ def _parse_climber_ascents_html(html: str, climber_slug: str) -> list[dict]:
     return ascents
 
 
-def scrape_climber_ascents(client: httpx.Client, climber_slug: str, all_ascents: bool = False) -> list[dict]:
+async def scrape_climber_ascents(client: httpx.AsyncClient, climber_slug: str, all_ascents: bool = False) -> list[dict]:
     """Scrape ascents listed on a climber profile."""
     suffix = "ascents/all" if all_ascents else "ascents"
     url = f"{BASE_URL}/climbers/{climber_slug}/{suffix}"
-    resp = _get(client, url)
+    resp = await _aget(client, url)
     if resp.status_code != 200:
         console.print(f"  [red]Failed to fetch ascents for climber {climber_slug}[/red]")
         return []
@@ -445,25 +465,17 @@ def scrape_climber_ascents(client: httpx.Client, climber_slug: str, all_ascents:
 
 
 # ---------------------------------------------------------------------------
-# Main entry point
+# DB helpers
 # ---------------------------------------------------------------------------
-
-def _scrape_route_worker(crag_slug: str, route: dict) -> list[dict]:
-    """Thread-pool worker: fetch ascents for one route using a per-thread client."""
-    client = _get_thread_client()
-    return scrape_route_ascents(client, crag_slug, route["slug"], route["name"], route["grade"])
-
 
 def _batch_insert_ascents(conn, ascents: list[dict]):
     """Batch-insert ascents and their climbers in bulk."""
     if not ascents:
         return
-    # Bulk upsert climbers
     conn.executemany(
         "INSERT OR IGNORE INTO climbers (username) VALUES (?)",
         [(a["username"],) for a in ascents],
     )
-    # Bulk insert ascents
     conn.executemany(
         """INSERT OR IGNORE INTO ascents (climber, route_id, route_name, grade, tick_type, date)
            VALUES (?, ?, ?, ?, ?, ?)""",
@@ -512,13 +524,17 @@ def _collect_crag_slugs_from_ascents(ascents: list[dict]) -> list[str]:
     return crag_slugs
 
 
-def _scrape_single_climber(conn, client: httpx.Client, climber_slug: str, all_ascents: bool = False) -> list[dict]:
+# ---------------------------------------------------------------------------
+# Main async logic
+# ---------------------------------------------------------------------------
+
+async def _scrape_single_climber(conn, client: httpx.AsyncClient, climber_slug: str, all_ascents: bool = False) -> list[dict]:
     """Scrape a single climber's ascent list."""
     label = "all ascents" if all_ascents else "ascents"
     console.print(f"Scraping {label} for climber [green]{climber_slug}[/green]")
 
     with console.status(f"[bold cyan]Fetching {label} for {climber_slug}..."):
-        ascents = scrape_climber_ascents(client, climber_slug, all_ascents=all_ascents)
+        ascents = await scrape_climber_ascents(client, climber_slug, all_ascents=all_ascents)
 
     if not ascents:
         console.print(f"[yellow]No ascents found for climber {climber_slug}.[/yellow]")
@@ -537,12 +553,11 @@ def _scrape_single_climber(conn, client: httpx.Client, climber_slug: str, all_as
     return ascents
 
 
-def _scrape_crags(conn, client: httpx.Client, crag_slugs: list[str], workers: int):
+async def _scrape_crags(conn, client: httpx.AsyncClient, crag_slugs: list[str], workers: int):
     """Scrape full route and ascent data for a set of crags."""
     console.print(f"Scraping [green]{len(crag_slugs)}[/green] specified crags")
 
-    total_routes = 0
-    total_ascents = 0
+    sem = asyncio.Semaphore(workers)
 
     with Progress(
         SpinnerColumn(),
@@ -554,7 +569,7 @@ def _scrape_crags(conn, client: httpx.Client, crag_slugs: list[str], workers: in
     ) as progress:
         crag_task = progress.add_task("Scraping crags", total=len(crag_slugs))
 
-        for i, crag_slug in enumerate(crag_slugs):
+        for crag_slug in crag_slugs:
             progress_key = f"crag:{crag_slug}"
             if get_progress(conn, progress_key) == "done":
                 progress.update(crag_task, description=f"[dim]{crag_slug} — skipped (done)[/dim]", advance=1)
@@ -562,9 +577,9 @@ def _scrape_crags(conn, client: httpx.Client, crag_slugs: list[str], workers: in
 
             progress.update(crag_task, description=f"Crag [cyan]{crag_slug}[/cyan]")
 
-            # Fetch route list (single request, not parallelized)
+            # Fetch route list
             try:
-                routes = scrape_routelist(client, crag_slug)
+                routes = await scrape_routelist(client, crag_slug)
             except Exception as e:
                 console.print(f"  [red]HTTP failed for {crag_slug}:[/red] {e}")
                 continue
@@ -583,41 +598,37 @@ def _scrape_crags(conn, client: httpx.Client, crag_slugs: list[str], workers: in
                 [(f"27c:{crag_slug}/{r['slug']}", r["name"], r["grade"]) for r in routes],
             )
 
-            # Scrape ascents in parallel using thread pool
-            crag_ascent_count = 0
+            # Scrape all route ascents concurrently
             route_task = progress.add_task(f"  Routes in {crag_slug}", total=len(routes))
+
+            tasks = [
+                scrape_route_ascents(
+                    client, sem, crag_slug, route["slug"],
+                    route["name"], route["grade"], route["ascent_count"],
+                )
+                for route in routes
+            ]
+
             all_ascents = []
-
-            with ThreadPoolExecutor(max_workers=workers) as pool:
-                future_to_route = {
-                    pool.submit(_scrape_route_worker, crag_slug, route): route
-                    for route in routes
-                }
-
-                for future in as_completed(future_to_route):
-                    route = future_to_route[future]
-                    try:
-                        ascents = future.result()
-                        all_ascents.extend(ascents)
-                        crag_ascent_count += len(ascents)
-                    except Exception as e:
-                        console.print(f"    [red]Failed to fetch ascents for {route['name']}:[/red] {e}")
-                    progress.update(route_task, advance=1)
+            for coro in asyncio.as_completed(tasks):
+                try:
+                    ascents = await coro
+                    all_ascents.extend(ascents)
+                except Exception as e:
+                    console.print(f"    [red]Failed route ascent fetch:[/red] {e}")
+                progress.update(route_task, advance=1)
 
             # Batch write all ascents for this crag at once
             _batch_insert_ascents(conn, all_ascents)
 
-            # Remove the per-crag route task once done
             progress.remove_task(route_task)
 
             conn.commit()
             set_progress(conn, progress_key, "done")
-            total_routes += len(routes)
-            total_ascents += crag_ascent_count
             progress.update(crag_task, advance=1)
 
 
-def scrape(
+async def _scrape_async(
     crag_slugs: list[str] | None = None,
     climber_slug: str | None = None,
     full: bool = False,
@@ -626,59 +637,45 @@ def scrape(
     workers: int = DEFAULT_WORKERS,
     debug: bool = False,
 ):
-    """Main scrape function.
-
-    Args:
-        crag_slugs: Specific crag slugs to scrape. If None, auto-discover.
-        climber_slug: Exact climber username to scrape.
-        full: When used with climber_slug, scrape all crags the climber has climbed at.
-        max_crags: Number of top crags to scrape (for auto-discover).
-        sort: Sort key for auto-discovery ('boulders' or 'likes').
-        workers: Number of threads for parallel route scraping.
-        debug: Print extra debug info.
-    """
+    """Async implementation of the main scrape function."""
     conn = get_connection()
-    client = _make_client()
 
-    if climber_slug:
-        ascents = _scrape_single_climber(conn, client, climber_slug, all_ascents=full)
-        if full and ascents:
-            crag_slugs = _collect_crag_slugs_from_ascents(ascents)
-            console.print(f"Found [green]{len(crag_slugs)}[/green] crags from {climber_slug}'s ascent history")
-            _scrape_crags(conn, client, crag_slugs, workers)
-        client.close()
-        # Summary
-        climber_count = conn.execute("SELECT COUNT(*) FROM climbers").fetchone()[0]
-        route_count = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
-        ascent_count = conn.execute("SELECT COUNT(*) FROM ascents").fetchone()[0]
-        console.print()
-        console.print(Panel(
-            f"[green]{climber_count}[/green] climbers  ·  [green]{route_count}[/green] routes  ·  [green]{ascent_count}[/green] ascents",
-            title="[bold]Scraping Complete",
-            border_style="green",
-        ))
-        conn.close()
-        return
+    async with _make_async_client() as client:
+        if climber_slug:
+            ascents = await _scrape_single_climber(conn, client, climber_slug, all_ascents=full)
+            if full and ascents:
+                crag_slugs = _collect_crag_slugs_from_ascents(ascents)
+                console.print(f"Found [green]{len(crag_slugs)}[/green] crags from {climber_slug}'s ascent history")
+                await _scrape_crags(conn, client, crag_slugs, workers)
 
-    # Step 1: Determine which crags to scrape
-    if not crag_slugs:
-        with console.status("[bold cyan]Discovering crags..."):
-            try:
-                all_crags = fetch_all_crags(client)
-                target_crags = filter_crags(all_crags, sort=sort)[:max_crags]
-                crag_slugs = [c["param_id"] for c in target_crags]
-                console.print(f"  Selected [green]{len(crag_slugs)}[/green] crags: {', '.join(crag_slugs[:5])}...")
-            except Exception as e:
-                console.print(f"[red]Failed to discover crags via HTTP:[/red] {e}")
-                client.close()
-                conn.close()
-                return
+            _print_summary(conn)
+            conn.close()
+            return
 
-    _scrape_crags(conn, client, crag_slugs, workers)
+        # Step 1: Determine which crags to scrape
+        if not crag_slugs:
+            with console.status("[bold cyan]Discovering crags..."):
+                try:
+                    # Use a sync client for the one-off crag discovery
+                    sync_client = _make_client()
+                    all_crags = fetch_all_crags(sync_client)
+                    sync_client.close()
+                    target_crags = filter_crags(all_crags, sort=sort)[:max_crags]
+                    crag_slugs = [c["param_id"] for c in target_crags]
+                    console.print(f"  Selected [green]{len(crag_slugs)}[/green] crags: {', '.join(crag_slugs[:5])}...")
+                except Exception as e:
+                    console.print(f"[red]Failed to discover crags via HTTP:[/red] {e}")
+                    conn.close()
+                    return
 
-    client.close()
+        await _scrape_crags(conn, client, crag_slugs, workers)
 
-    # Summary
+    _print_summary(conn)
+    conn.close()
+
+
+def _print_summary(conn):
+    """Print final DB summary."""
     climber_count = conn.execute("SELECT COUNT(*) FROM climbers").fetchone()[0]
     route_count = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
     ascent_count = conn.execute("SELECT COUNT(*) FROM ascents").fetchone()[0]
@@ -690,4 +687,37 @@ def scrape(
         border_style="green",
     ))
 
-    conn.close()
+
+# ---------------------------------------------------------------------------
+# Public sync wrapper
+# ---------------------------------------------------------------------------
+
+def scrape(
+    crag_slugs: list[str] | None = None,
+    climber_slug: str | None = None,
+    full: bool = False,
+    max_crags: int = 10,
+    sort: str = "boulders",
+    workers: int = DEFAULT_WORKERS,
+    debug: bool = False,
+):
+    """Main scrape function (sync entry point).
+
+    Args:
+        crag_slugs: Specific crag slugs to scrape. If None, auto-discover.
+        climber_slug: Exact climber username to scrape.
+        full: When used with climber_slug, scrape all crags the climber has climbed at.
+        max_crags: Number of top crags to scrape (for auto-discover).
+        sort: Sort key for auto-discovery ('boulders' or 'likes').
+        workers: Number of threads for parallel route scraping.
+        debug: Print extra debug info.
+    """
+    asyncio.run(_scrape_async(
+        crag_slugs=crag_slugs,
+        climber_slug=climber_slug,
+        full=full,
+        max_crags=max_crags,
+        sort=sort,
+        workers=workers,
+        debug=debug,
+    ))
