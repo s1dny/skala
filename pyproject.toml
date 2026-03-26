@@ -9,6 +9,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "click>=8.1",
     "playwright>=1.50",
+    "rich>=13.0",
 ]
 
 [build-system]

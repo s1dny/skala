@@ -1,8 +1,12 @@
 import click
+from rich.console import Console
+from rich.table import Table
 
 from skala.db import get_connection
 from skala.scraper import scrape as run_scrape, list_crags
 from skala.elo import calculate_elos
+
+console = Console()
 
 
 @click.group()
@@ -35,14 +39,27 @@ def scrape(crags, max_crags, min_boulders, debug):
 @click.option("--limit", default=50, help="Number of crags to show")
 def crags(min_boulders, limit):
     """List crags with boulder routes from 27crags.com."""
-    results = list_crags(min_boulders=min_boulders, limit=limit)
-    print(f"\n{'#':<5}{'Slug':<35}{'Name':<30}{'Boulders':<10}")
-    print("-" * 80)
+    with console.status("[bold cyan]Fetching crag list..."):
+        results = list_crags(min_boulders=min_boulders, limit=limit)
+
+    if not results:
+        console.print("[yellow]No crags found matching criteria.[/yellow]")
+        return
+
+    table = Table(title=f"Top {len(results)} Boulder Crags", show_lines=False)
+    table.add_column("#", style="dim", width=4, justify="right")
+    table.add_column("Slug", style="cyan", max_width=35)
+    table.add_column("Name", style="bold white", max_width=30)
+    table.add_column("Boulders", style="green", justify="right")
+
     for i, c in enumerate(results, 1):
         name = c.get("name", "?")[:28]
         slug = c.get("param_id", "?")[:33]
-        boulders = c.get("boulder_count", 0)
-        print(f"{i:<5}{slug:<35}{name:<30}{boulders}")
+        boulders = str(c.get("boulder_count", 0))
+        table.add_row(str(i), slug, name, boulders)
+
+    console.print()
+    console.print(table)
 
 
 @main.command()
@@ -63,20 +80,46 @@ def rankings(entity_type, limit):
             "SELECT username, elo, matches FROM climbers WHERE matches > 0 ORDER BY elo DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        print(f"\n{'Rank':<6}{'Climber':<30}{'ELO':<10}{'Matches'}")
-        print("-" * 56)
+
+        if not rows:
+            console.print("[yellow]No climber rankings yet. Run 'skala calculate' first.[/yellow]")
+            conn.close()
+            return
+
+        table = Table(title=f"Top {len(rows)} Climbers by ELO")
+        table.add_column("Rank", style="dim", width=5, justify="right")
+        table.add_column("Climber", style="bold cyan", max_width=30)
+        table.add_column("ELO", style="bold green", justify="right")
+        table.add_column("Matches", style="white", justify="right")
+
         for i, row in enumerate(rows, 1):
-            print(f"{i:<6}{row['username']:<30}{row['elo']:<10.1f}{row['matches']}")
+            elo_str = f"{row['elo']:.1f}"
+            table.add_row(str(i), row["username"], elo_str, str(row["matches"]))
+
     else:
         rows = conn.execute(
             "SELECT route_id, name, grade, elo, matches FROM routes WHERE matches > 0 ORDER BY elo DESC LIMIT ?",
             (limit,),
         ).fetchall()
-        print(f"\n{'Rank':<6}{'Route':<35}{'Grade':<10}{'ELO':<10}{'Matches'}")
-        print("-" * 71)
+
+        if not rows:
+            console.print("[yellow]No route rankings yet. Run 'skala calculate' first.[/yellow]")
+            conn.close()
+            return
+
+        table = Table(title=f"Top {len(rows)} Routes by ELO")
+        table.add_column("Rank", style="dim", width=5, justify="right")
+        table.add_column("Route", style="bold cyan", max_width=35)
+        table.add_column("Grade", style="yellow", width=8, justify="center")
+        table.add_column("ELO", style="bold green", justify="right")
+        table.add_column("Matches", style="white", justify="right")
+
         for i, row in enumerate(rows, 1):
             name = (row["name"] or "Unknown")[:33]
             grade = row["grade"] or "?"
-            print(f"{i:<6}{name:<35}{grade:<10}{row['elo']:<10.1f}{row['matches']}")
+            elo_str = f"{row['elo']:.1f}"
+            table.add_row(str(i), name, grade, elo_str, str(row["matches"]))
 
+    console.print()
+    console.print(table)
     conn.close()
