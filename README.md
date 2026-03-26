@@ -1,6 +1,6 @@
-# uv run skala
+# Skala
 
-Two-sided ELO rating system for rock climbing. Every ascent is a match between climber and route — flash it, and you win; struggle on it, and the route wins. Over time, both climbers and routes converge on accurate ratings.
+Two-sided ELO rating system for rock climbing. Every ascent is a match between climber and route: flash it, you win; no flash?, and the route wins. Over time, both climbers and routes converge on accurate ratings.
 
 Data sourced from [27crags.com](https://27crags.com).
 
