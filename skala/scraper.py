@@ -11,7 +11,6 @@ Strategy:
 import json
 import re
 import time
-import random
 import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -23,9 +22,6 @@ from rich.panel import Panel
 
 from skala.db import (
     get_connection,
-    upsert_climber,
-    upsert_route,
-    insert_ascent,
     get_progress,
     set_progress,
 )
@@ -390,6 +386,63 @@ def scrape_route_ascents(client: httpx.Client, crag_slug: str, route_slug: str,
     return ascents
 
 
+def _parse_climber_ascents_html(html: str, climber_slug: str) -> list[dict]:
+    """Parse ascents from a climber's public ascent list page."""
+    soup = BeautifulSoup(html, HTML_PARSER)
+    ascents = []
+
+    for row in soup.select("table.ascent-list tr"):
+        route_links = row.select('td.stxt a[href*="/crags/"][href*="/routes/"]')
+        if not route_links:
+            continue
+
+        route_link = next((link for link in route_links if link.get_text(strip=True)), route_links[0])
+        href = route_link.get("href", "")
+        route_match = re.search(r"/crags/([^/]+)/routes/([^/?#]+)", href)
+        if not route_match:
+            continue
+
+        crag_slug, route_slug = route_match.groups()
+        route_name = route_link.get_text(strip=True) or route_slug
+
+        grade_el = row.select_one("td.grade span.grade")
+        grade = grade_el.get_text(strip=True) if grade_el else None
+
+        date = None
+        date_el = row.select_one("td.ascent-date")
+        if date_el:
+            date_match = re.search(r"\d{4}-\d{2}-\d{2}", date_el.get_text(" ", strip=True))
+            if date_match:
+                date = date_match.group(0)
+
+        tick_type = None
+        tick_el = row.select_one("span.ascent-type")
+        if tick_el:
+            tick_type = TICK_TYPE_MAP.get(tick_el.get_text(strip=True).lower())
+
+        ascents.append({
+            "username": climber_slug,
+            "route_id": f"27c:{crag_slug}/{route_slug}",
+            "route_name": route_name,
+            "grade": grade,
+            "tick_type": tick_type,
+            "date": date,
+        })
+
+    return ascents
+
+
+def scrape_climber_ascents(client: httpx.Client, climber_slug: str) -> list[dict]:
+    """Scrape all boulder ascents listed on a climber profile."""
+    url = f"{BASE_URL}/climbers/{climber_slug}/ascents"
+    resp = _get(client, url)
+    if resp.status_code != 200:
+        console.print(f"  [red]Failed to fetch ascents for climber {climber_slug}[/red]")
+        return []
+
+    return _parse_climber_ascents_html(resp.text, climber_slug)
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -420,8 +473,55 @@ def _batch_insert_ascents(conn, ascents: list[dict]):
     )
 
 
+def _batch_upsert_routes(conn, ascents: list[dict]):
+    """Batch-upsert route rows for scraped ascent records."""
+    if not ascents:
+        return
+
+    seen = set()
+    rows = []
+    for ascent in ascents:
+        route_id = ascent["route_id"]
+        if route_id in seen:
+            continue
+        seen.add(route_id)
+        rows.append((route_id, ascent["route_name"], ascent["grade"]))
+
+    conn.executemany(
+        """INSERT INTO routes (route_id, name, grade) VALUES (?, ?, ?)
+           ON CONFLICT(route_id) DO UPDATE SET
+               name = COALESCE(excluded.name, routes.name),
+               grade = COALESCE(excluded.grade, routes.grade)""",
+        rows,
+    )
+
+
+def _scrape_single_climber(conn, client: httpx.Client, climber_slug: str):
+    """Scrape a single climber's ascent list."""
+    console.print(f"Scraping ascents for climber [green]{climber_slug}[/green]")
+
+    with console.status(f"[bold cyan]Fetching ascents for {climber_slug}..."):
+        ascents = scrape_climber_ascents(client, climber_slug)
+
+    if not ascents:
+        console.print(f"[yellow]No ascents found for climber {climber_slug}.[/yellow]")
+        return
+
+    _batch_upsert_routes(conn, ascents)
+    _batch_insert_ascents(conn, ascents)
+    conn.commit()
+
+    console.print()
+    console.print(Panel(
+        f"[green]{climber_slug}[/green]  ·  [green]{len(ascents)}[/green] ascents imported",
+        title="[bold]Climber Scrape Complete",
+        border_style="green",
+    ))
+
+
 def scrape(
     crag_slugs: list[str] | None = None,
+    climber_slug: str | None = None,
     max_crags: int = 10,
     sort: str = "boulders",
     workers: int = DEFAULT_WORKERS,
@@ -438,6 +538,12 @@ def scrape(
     """
     conn = get_connection()
     client = _make_client()
+
+    if climber_slug:
+        _scrape_single_climber(conn, client, climber_slug)
+        client.close()
+        conn.close()
+        return
 
     # Step 1: Determine which crags to scrape
     if not crag_slugs:

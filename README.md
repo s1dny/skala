@@ -29,11 +29,16 @@ Lists crags from 27crags.com, showing the slug you need for scraping. Sort by `b
 # Scrape specific crags by slug
 uv run skala scrape --crags magic-wood,cresciano,fontainebleau
 
+# Scrape one climber directly by exact username
+uv run skala scrape --climber pelez
+
 # Auto-discover and scrape top 10 crags by likes
 uv run skala scrape --crags 10 --sort likes
 ```
 
 Fetches route lists and all logged ascents for each crag. `--crags` accepts a number (top N by sort order) or comma-separated slugs. Progress is tracked per-crag, so interrupted scrapes resume where they left off.
+
+`--climber` bypasses crag discovery and imports the ascents listed on a single climber profile. The user must provide the exact climber username.
 
 ### Calculate ELO
 
@@ -48,6 +53,7 @@ Processes all ascents chronologically and updates ELO ratings for every climber 
 ```
 uv run skala rankings --type routes --limit 20
 uv run skala rankings --type climbers --limit 20
+uv run skala rankings --climber pelez
 ```
 
 ## How ELO works here
