@@ -32,6 +32,9 @@ uv run skala scrape --crags magic-wood,cresciano,fontainebleau
 # Scrape one climber directly by exact username
 uv run skala scrape --climber pelez
 
+# Scrape every crag the climber has climbed at
+uv run skala scrape --climber pelez --full
+
 # Auto-discover and scrape top 10 crags by likes
 uv run skala scrape --crags 10 --sort likes
 ```
@@ -39,6 +42,8 @@ uv run skala scrape --crags 10 --sort likes
 Fetches route lists and all logged ascents for each crag. `--crags` accepts a number (top N by sort order) or comma-separated slugs. Progress is tracked per-crag, so interrupted scrapes resume where they left off.
 
 `--climber` bypasses crag discovery and imports the ascents listed on a single climber profile. The user must provide the exact climber username.
+
+`--climber --full` uses the climber's full ascent history to discover every crag they have climbed at, then runs the full crag scraper for those crags.
 
 ### Calculate ELO
 

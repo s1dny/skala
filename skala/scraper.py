@@ -432,9 +432,10 @@ def _parse_climber_ascents_html(html: str, climber_slug: str) -> list[dict]:
     return ascents
 
 
-def scrape_climber_ascents(client: httpx.Client, climber_slug: str) -> list[dict]:
-    """Scrape all boulder ascents listed on a climber profile."""
-    url = f"{BASE_URL}/climbers/{climber_slug}/ascents"
+def scrape_climber_ascents(client: httpx.Client, climber_slug: str, all_ascents: bool = False) -> list[dict]:
+    """Scrape ascents listed on a climber profile."""
+    suffix = "ascents/all" if all_ascents else "ascents"
+    url = f"{BASE_URL}/climbers/{climber_slug}/{suffix}"
     resp = _get(client, url)
     if resp.status_code != 200:
         console.print(f"  [red]Failed to fetch ascents for climber {climber_slug}[/red]")
@@ -496,16 +497,32 @@ def _batch_upsert_routes(conn, ascents: list[dict]):
     )
 
 
-def _scrape_single_climber(conn, client: httpx.Client, climber_slug: str):
-    """Scrape a single climber's ascent list."""
-    console.print(f"Scraping ascents for climber [green]{climber_slug}[/green]")
+def _collect_crag_slugs_from_ascents(ascents: list[dict]) -> list[str]:
+    """Collect unique crag slugs from a list of ascent records."""
+    seen = set()
+    crag_slugs = []
+    for ascent in ascents:
+        route_id = ascent.get("route_id", "")
+        if ":" not in route_id or "/" not in route_id:
+            continue
+        crag_slug = route_id.split(":", 1)[1].split("/", 1)[0]
+        if crag_slug and crag_slug not in seen:
+            seen.add(crag_slug)
+            crag_slugs.append(crag_slug)
+    return crag_slugs
 
-    with console.status(f"[bold cyan]Fetching ascents for {climber_slug}..."):
-        ascents = scrape_climber_ascents(client, climber_slug)
+
+def _scrape_single_climber(conn, client: httpx.Client, climber_slug: str, all_ascents: bool = False) -> list[dict]:
+    """Scrape a single climber's ascent list."""
+    label = "all ascents" if all_ascents else "ascents"
+    console.print(f"Scraping {label} for climber [green]{climber_slug}[/green]")
+
+    with console.status(f"[bold cyan]Fetching {label} for {climber_slug}..."):
+        ascents = scrape_climber_ascents(client, climber_slug, all_ascents=all_ascents)
 
     if not ascents:
         console.print(f"[yellow]No ascents found for climber {climber_slug}.[/yellow]")
-        return
+        return []
 
     _batch_upsert_routes(conn, ascents)
     _batch_insert_ascents(conn, ascents)
@@ -517,50 +534,13 @@ def _scrape_single_climber(conn, client: httpx.Client, climber_slug: str):
         title="[bold]Climber Scrape Complete",
         border_style="green",
     ))
+    return ascents
 
 
-def scrape(
-    crag_slugs: list[str] | None = None,
-    climber_slug: str | None = None,
-    max_crags: int = 10,
-    sort: str = "boulders",
-    workers: int = DEFAULT_WORKERS,
-    debug: bool = False,
-):
-    """Main scrape function.
+def _scrape_crags(conn, client: httpx.Client, crag_slugs: list[str], workers: int):
+    """Scrape full route and ascent data for a set of crags."""
+    console.print(f"Scraping [green]{len(crag_slugs)}[/green] specified crags")
 
-    Args:
-        crag_slugs: Specific crag slugs to scrape. If None, auto-discover.
-        max_crags: Number of top crags to scrape (for auto-discover).
-        sort: Sort key for auto-discovery ('boulders' or 'likes').
-        workers: Number of threads for parallel route scraping.
-        debug: Print extra debug info.
-    """
-    conn = get_connection()
-    client = _make_client()
-
-    if climber_slug:
-        _scrape_single_climber(conn, client, climber_slug)
-        client.close()
-        conn.close()
-        return
-
-    # Step 1: Determine which crags to scrape
-    if not crag_slugs:
-        with console.status("[bold cyan]Discovering crags..."):
-            try:
-                all_crags = fetch_all_crags(client)
-                target_crags = filter_crags(all_crags, sort=sort)[:max_crags]
-                crag_slugs = [c["param_id"] for c in target_crags]
-                console.print(f"  Selected [green]{len(crag_slugs)}[/green] crags: {', '.join(crag_slugs[:5])}...")
-            except Exception as e:
-                console.print(f"[red]Failed to discover crags via HTTP:[/red] {e}")
-                client.close()
-                return
-    else:
-        console.print(f"Scraping [green]{len(crag_slugs)}[/green] specified crags")
-
-    # Step 2: For each crag, scrape routes and ascents (routes in parallel)
     total_routes = 0
     total_ascents = 0
 
@@ -635,6 +615,66 @@ def scrape(
             total_routes += len(routes)
             total_ascents += crag_ascent_count
             progress.update(crag_task, advance=1)
+
+
+def scrape(
+    crag_slugs: list[str] | None = None,
+    climber_slug: str | None = None,
+    full: bool = False,
+    max_crags: int = 10,
+    sort: str = "boulders",
+    workers: int = DEFAULT_WORKERS,
+    debug: bool = False,
+):
+    """Main scrape function.
+
+    Args:
+        crag_slugs: Specific crag slugs to scrape. If None, auto-discover.
+        climber_slug: Exact climber username to scrape.
+        full: When used with climber_slug, scrape all crags the climber has climbed at.
+        max_crags: Number of top crags to scrape (for auto-discover).
+        sort: Sort key for auto-discovery ('boulders' or 'likes').
+        workers: Number of threads for parallel route scraping.
+        debug: Print extra debug info.
+    """
+    conn = get_connection()
+    client = _make_client()
+
+    if climber_slug:
+        ascents = _scrape_single_climber(conn, client, climber_slug, all_ascents=full)
+        if full and ascents:
+            crag_slugs = _collect_crag_slugs_from_ascents(ascents)
+            console.print(f"Found [green]{len(crag_slugs)}[/green] crags from {climber_slug}'s ascent history")
+            _scrape_crags(conn, client, crag_slugs, workers)
+        client.close()
+        # Summary
+        climber_count = conn.execute("SELECT COUNT(*) FROM climbers").fetchone()[0]
+        route_count = conn.execute("SELECT COUNT(*) FROM routes").fetchone()[0]
+        ascent_count = conn.execute("SELECT COUNT(*) FROM ascents").fetchone()[0]
+        console.print()
+        console.print(Panel(
+            f"[green]{climber_count}[/green] climbers  ·  [green]{route_count}[/green] routes  ·  [green]{ascent_count}[/green] ascents",
+            title="[bold]Scraping Complete",
+            border_style="green",
+        ))
+        conn.close()
+        return
+
+    # Step 1: Determine which crags to scrape
+    if not crag_slugs:
+        with console.status("[bold cyan]Discovering crags..."):
+            try:
+                all_crags = fetch_all_crags(client)
+                target_crags = filter_crags(all_crags, sort=sort)[:max_crags]
+                crag_slugs = [c["param_id"] for c in target_crags]
+                console.print(f"  Selected [green]{len(crag_slugs)}[/green] crags: {', '.join(crag_slugs[:5])}...")
+            except Exception as e:
+                console.print(f"[red]Failed to discover crags via HTTP:[/red] {e}")
+                client.close()
+                conn.close()
+                return
+
+    _scrape_crags(conn, client, crag_slugs, workers)
 
     client.close()
 

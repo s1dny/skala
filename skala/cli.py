@@ -40,18 +40,21 @@ def main():
 @main.command()
 @click.option("--crags", help="Number of top crags to auto-discover, or comma-separated slugs")
 @click.option("--climber", help="Exact climber username to scrape directly")
+@click.option("--full", is_flag=True, help="With --climber, scrape all crags the climber has climbed at")
 @click.option("--sort", type=click.Choice(["boulders", "likes"]), default="boulders", help="Sort order for auto-discovery")
 @click.option("--workers", default=6, help="Number of threads for parallel route scraping")
 @click.option("--debug", is_flag=True, help="Extra debug output")
-def scrape(crags, climber, sort, workers, debug):
+def scrape(crags, climber, full, sort, workers, debug):
     """Scrape climbing data from 27crags.com."""
     climber_slug = _normalize_climber_arg(climber)
 
     if climber_slug:
         if crags:
             raise click.UsageError("--crags and --climber cannot be used together.")
-        run_scrape(climber_slug=climber_slug, sort=sort, workers=workers, debug=debug)
+        run_scrape(climber_slug=climber_slug, full=full, sort=sort, workers=workers, debug=debug)
         return
+    if full:
+        raise click.UsageError("--full can only be used together with --climber.")
 
     crags = crags or "10"
     if crags.isdigit():
