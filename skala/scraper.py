@@ -6,8 +6,6 @@ Strategy:
   2. For each target crag, fetch /crags/{slug}/routelist → parse route table
   3. For each route with ascents, fetch route page + /more endpoint → parse ticks
   4. Climber list is built organically from ascent data
-
-Uses httpx (network requests) first; falls back to playwright if blocked.
 """
 
 import json
@@ -372,93 +370,6 @@ def scrape_route_ascents(client: httpx.Client, crag_slug: str, route_slug: str,
 
 
 # ---------------------------------------------------------------------------
-# Playwright fallback
-# ---------------------------------------------------------------------------
-
-def _scrape_with_playwright(crag_slugs: list[str], conn, debug: bool):
-    """Fallback: use headless browser if HTTP requests fail."""
-    from playwright.sync_api import sync_playwright
-
-    console.print("[yellow]Falling back to Playwright browser...[/yellow]")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=False)
-        context = browser.new_context(
-            user_agent=HEADERS["User-Agent"],
-            viewport={"width": 1280, "height": 720},
-            locale="en-US",
-        )
-        page = context.new_page()
-
-        with Progress(
-            SpinnerColumn(),
-            TextColumn("[bold blue]{task.description}"),
-            BarColumn(bar_width=40),
-            MofNCompleteColumn(),
-            console=console,
-        ) as progress:
-            crag_task = progress.add_task("Crags (playwright)", total=len(crag_slugs))
-
-            for crag_slug in crag_slugs:
-                progress_key = f"crag:{crag_slug}"
-                if get_progress(conn, progress_key) == "done":
-                    progress.update(crag_task, advance=1)
-                    continue
-
-                progress.update(crag_task, description=f"[playwright] {crag_slug}")
-
-                # Fetch route list
-                page.goto(f"{BASE_URL}/crags/{crag_slug}/routelist", wait_until="domcontentloaded")
-                page.wait_for_timeout(3000)
-                html = page.content()
-                soup = BeautifulSoup(html, "html.parser")
-
-                routes = []
-                for row in soup.select("tr"):
-                    link = row.select_one('a[href*="/routes/"]')
-                    if not link:
-                        continue
-                    href = link.get("href", "")
-                    slug_match = re.search(r'/crags/[^/]+/routes/([^/?#]+)', href)
-                    if slug_match:
-                        route_slug = slug_match.group(1)
-                        route_name = link.get_text(strip=True)
-                        grade = None
-                        grade_el = row.select_one(".grade, td:nth-child(2)")
-                        if grade_el:
-                            gt = grade_el.get_text(strip=True)
-                            if re.match(r'^[0-9VvBb]', gt):
-                                grade = gt
-                        routes.append((route_slug, route_name, grade))
-
-                route_task = progress.add_task(f"  Routes in {crag_slug}", total=len(routes))
-
-                for route_slug, route_name, grade in routes:
-                    route_id = f"27c:{crag_slug}/{route_slug}"
-                    upsert_route(conn, route_id, route_name, grade)
-
-                    page.goto(f"{BASE_URL}/crags/{crag_slug}/routes/{route_slug}",
-                              wait_until="domcontentloaded")
-                    page.wait_for_timeout(2000)
-                    route_html = page.content()
-
-                    ascents = _parse_ascent_html(route_html, crag_slug, route_slug, route_name, grade)
-                    for a in ascents:
-                        upsert_climber(conn, a["username"])
-                        insert_ascent(conn, a["username"], a["route_id"],
-                                      a["route_name"], a["grade"], a["tick_type"], a["date"])
-
-                    progress.update(route_task, advance=1)
-                    _polite_sleep(1.0, 2.0)
-
-                conn.commit()
-                set_progress(conn, progress_key, "done")
-                progress.update(crag_task, advance=1)
-
-        browser.close()
-
-
-# ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
 
@@ -478,7 +389,6 @@ def scrape(
     """
     conn = get_connection()
     client = _make_client()
-    use_playwright = False
 
     # Step 1: Determine which crags to scrape
     if not crag_slugs:
@@ -525,8 +435,7 @@ def scrape(
                 routes = scrape_routelist(client, crag_slug)
             except Exception as e:
                 console.print(f"  [red]HTTP failed for {crag_slug}:[/red] {e}")
-                use_playwright = True
-                break
+                continue
 
             if not routes:
                 progress.update(crag_task, description=f"[dim]{crag_slug} — no routes[/dim]", advance=1)
@@ -548,8 +457,7 @@ def scrape(
                     )
                 except Exception as e:
                     console.print(f"    [red]Failed to fetch ascents for {route['name']}:[/red] {e}")
-                    use_playwright = True
-                    break
+                    continue
 
                 for a in ascents:
                     upsert_climber(conn, a["username"])
@@ -568,9 +476,6 @@ def scrape(
             # Remove the per-crag route task once done
             progress.remove_task(route_task)
 
-            if use_playwright:
-                break
-
             conn.commit()
             set_progress(conn, progress_key, "done")
             total_routes += len(routes)
@@ -579,13 +484,6 @@ def scrape(
             _polite_sleep(2.0, 4.0)
 
     client.close()
-
-    # Step 3: Playwright fallback for remaining crags
-    if use_playwright:
-        remaining = [s for s in crag_slugs if get_progress(conn, f"crag:{s}") != "done"]
-        if remaining:
-            console.print(f"\n[yellow]Falling back to Playwright for {len(remaining)} remaining crags...[/yellow]")
-            _scrape_with_playwright(remaining, conn, debug)
 
     # Summary
     climber_count = conn.execute("SELECT COUNT(*) FROM climbers").fetchone()[0]
