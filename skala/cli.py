@@ -16,49 +16,44 @@ def main():
 
 
 @main.command()
-@click.option("--crags", default=None, help="Comma-separated crag slugs (e.g. fontainebleau,magic-wood-15945)")
-@click.option("--max-crags", default=10, help="Max crags to auto-discover if none specified")
-@click.option("--min-boulders", default=50, help="Min boulder count for auto-discovery")
+@click.option("--crags", default="10", help="Number of top crags to auto-discover, or comma-separated slugs")
+@click.option("--sort", type=click.Choice(["boulders", "likes"]), default="boulders", help="Sort order for auto-discovery")
 @click.option("--workers", default=6, help="Number of threads for parallel route scraping")
 @click.option("--debug", is_flag=True, help="Extra debug output")
-def scrape(crags, max_crags, min_boulders, workers, debug):
+def scrape(crags, sort, workers, debug):
     """Scrape climbing data from 27crags.com."""
-    crag_slugs = None
-    if crags:
+    if crags.isdigit():
+        run_scrape(max_crags=int(crags), sort=sort, workers=workers, debug=debug)
+    else:
         crag_slugs = [s.strip() for s in crags.split(",") if s.strip()]
-
-    run_scrape(
-        crag_slugs=crag_slugs,
-        max_crags=max_crags,
-        min_boulders=min_boulders,
-        workers=workers,
-        debug=debug,
-    )
+        run_scrape(crag_slugs=crag_slugs, sort=sort, workers=workers, debug=debug)
 
 
 @main.command()
-@click.option("--min-boulders", default=50, help="Min boulder count to show")
 @click.option("--limit", default=50, help="Number of crags to show")
-def crags(min_boulders, limit):
+@click.option("--sort", type=click.Choice(["boulders", "likes"]), default="boulders", help="Sort crags by this field")
+def crags(limit, sort):
     """List crags with boulder routes from 27crags.com."""
     with console.status("[bold cyan]Fetching crag list..."):
-        results = list_crags(min_boulders=min_boulders, limit=limit)
+        results = list_crags(limit=limit, sort=sort)
 
     if not results:
         console.print("[yellow]No crags found matching criteria.[/yellow]")
         return
 
-    table = Table(title=f"Top {len(results)} Boulder Crags", show_lines=False)
+    table = Table(title=f"Top {len(results)} Boulder Crags (sorted by {sort})", show_lines=False)
     table.add_column("#", style="dim", width=4, justify="right")
     table.add_column("Slug", style="cyan", max_width=35)
     table.add_column("Name", style="bold white", max_width=30)
     table.add_column("Boulders", style="green", justify="right")
+    table.add_column("Likes", style="magenta", justify="right")
 
     for i, c in enumerate(results, 1):
         name = c.get("name", "?")[:28]
         slug = c.get("param_id", "?")[:33]
         boulders = str(c.get("boulder_count", 0))
-        table.add_row(str(i), slug, name, boulders)
+        likes = str(c.get("likes_count", 0))
+        table.add_row(str(i), slug, name, boulders, likes)
 
     console.print()
     console.print(table)

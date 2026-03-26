@@ -17,10 +17,11 @@ uv sync
 ### Discover crags
 
 ```
-uv run skala crags --min-boulders 100 --limit 20
+uv run skala crags --limit 20
+uv run skala crags --sort likes
 ```
 
-Lists crags from 27crags.com sorted by boulder count, showing the slug you need for scraping.
+Lists crags from 27crags.com, showing the slug you need for scraping. Sort by `boulders` (default) or `likes`.
 
 ### Scrape
 
@@ -28,11 +29,11 @@ Lists crags from 27crags.com sorted by boulder count, showing the slug you need 
 # Scrape specific crags by slug
 uv run skala scrape --crags magic-wood,cresciano,fontainebleau
 
-# Auto-discover and scrape top crags by boulder count
-uv run skala scrape --max-crags 5 --min-boulders 200
+# Auto-discover and scrape top 10 crags by likes
+uv run skala scrape --crags 10 --sort likes
 ```
 
-Fetches route lists and all logged ascents for each crag. Progress is tracked per-crag, so interrupted scrapes resume where they left off. Uses HTTP requests by default; falls back to a Playwright browser automatically if needed.
+Fetches route lists and all logged ascents for each crag. `--crags` accepts a number (top N by sort order) or comma-separated slugs. Progress is tracked per-crag, so interrupted scrapes resume where they left off.
 
 ### Calculate ELO
 

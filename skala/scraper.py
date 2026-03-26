@@ -65,7 +65,7 @@ except ImportError:
 _thread_local = threading.local()
 
 # Default concurrency for route scraping within a crag
-DEFAULT_WORKERS = 8
+DEFAULT_WORKERS = 10
 
 
 def _parse_grade_code(code: str) -> str | None:
@@ -85,10 +85,6 @@ def _parse_grade_code(code: str) -> str | None:
     if re.match(r'^[0-9VvBb]', code):
         return code
     return code
-
-
-def _polite_sleep(low: float = 1.0, high: float = 3.0):
-    time.sleep(random.uniform(low, high))
 
 
 # ---------------------------------------------------------------------------
@@ -205,24 +201,26 @@ def _enrich_crags_with_slugs(crags: list[dict], page_html: str):
         crag["_id_fallback"] = str(crag.get("id", ""))
 
 
-def list_crags(min_boulders: int = 50, limit: int = 50) -> list[dict]:
-    """Discover crags with boulder routes. Returns sorted by boulder count."""
+SORT_KEYS = {
+    "boulders": lambda c: int(c.get("boulder_count", 0)),
+    "likes": lambda c: int(c.get("likes_count", 0)),
+}
+
+
+def list_crags(limit: int = 50, sort: str = "boulders") -> list[dict]:
+    """Discover crags with boulder routes. Returns sorted by the chosen key."""
     client = _make_client()
     all_crags = fetch_all_crags(client)
     client.close()
-    filtered = filter_crags(all_crags, min_boulders)
+    filtered = filter_crags(all_crags, sort=sort)
     return filtered[:limit]
 
 
-def filter_crags(crags: list[dict], min_boulders: int = 50) -> list[dict]:
-    """Filter crags to those with enough boulder routes."""
-    filtered = []
-    for c in crags:
-        boulder_count = c.get("boulder_count", 0)
-        if boulder_count and int(boulder_count) >= min_boulders:
-            filtered.append(c)
-    # Sort by boulder count descending
-    filtered.sort(key=lambda c: int(c.get("boulder_count", 0)), reverse=True)
+def filter_crags(crags: list[dict], sort: str = "boulders") -> list[dict]:
+    """Filter crags to those with boulder routes, sorted by the chosen key."""
+    filtered = [c for c in crags if int(c.get("boulder_count", 0)) > 0]
+    key_fn = SORT_KEYS.get(sort, SORT_KEYS["boulders"])
+    filtered.sort(key=key_fn, reverse=True)
     return filtered
 
 
@@ -399,7 +397,6 @@ def scrape_route_ascents(client: httpx.Client, crag_slug: str, route_slug: str,
 def _scrape_route_worker(crag_slug: str, route: dict) -> list[dict]:
     """Thread-pool worker: fetch ascents for one route using a per-thread client."""
     client = _get_thread_client()
-    _polite_sleep(0.1, 1)  # stagger requests across threads
     return scrape_route_ascents(client, crag_slug, route["slug"], route["name"], route["grade"])
 
 
@@ -425,8 +422,8 @@ def _batch_insert_ascents(conn, ascents: list[dict]):
 
 def scrape(
     crag_slugs: list[str] | None = None,
-    min_boulders: int = 50,
     max_crags: int = 10,
+    sort: str = "boulders",
     workers: int = DEFAULT_WORKERS,
     debug: bool = False,
 ):
@@ -434,8 +431,8 @@ def scrape(
 
     Args:
         crag_slugs: Specific crag slugs to scrape. If None, auto-discover.
-        min_boulders: Minimum boulder count to include a crag (for auto-discover).
-        max_crags: Maximum number of crags to scrape (for auto-discover).
+        max_crags: Number of top crags to scrape (for auto-discover).
+        sort: Sort key for auto-discovery ('boulders' or 'likes').
         workers: Number of threads for parallel route scraping.
         debug: Print extra debug info.
     """
@@ -447,10 +444,7 @@ def scrape(
         with console.status("[bold cyan]Discovering crags..."):
             try:
                 all_crags = fetch_all_crags(client)
-                if all_crags and all_crags[0].get("boulder_count"):
-                    target_crags = filter_crags(all_crags, min_boulders)[:max_crags]
-                else:
-                    target_crags = all_crags[:max_crags]
+                target_crags = filter_crags(all_crags, sort=sort)[:max_crags]
                 crag_slugs = [c["param_id"] for c in target_crags]
                 console.print(f"  Selected [green]{len(crag_slugs)}[/green] crags: {', '.join(crag_slugs[:5])}...")
             except Exception as e:
@@ -492,7 +486,6 @@ def scrape(
             if not routes:
                 progress.update(crag_task, description=f"[dim]{crag_slug} — no routes[/dim]", advance=1)
                 set_progress(conn, progress_key, "done")
-                _polite_sleep()
                 continue
 
             # Bulk upsert routes
@@ -536,7 +529,6 @@ def scrape(
             total_routes += len(routes)
             total_ascents += crag_ascent_count
             progress.update(crag_task, advance=1)
-            _polite_sleep(1.0, 2.0)
 
     client.close()
 
