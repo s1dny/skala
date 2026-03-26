@@ -9,6 +9,7 @@ dependencies = [
     "beautifulsoup4>=4.12",
     "click>=8.1",
     "rich>=13.0",
+    "lxml>=5.0",
 ]
 
 [build-system]

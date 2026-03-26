@@ -12,6 +12,8 @@ import json
 import re
 import time
 import random
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import httpx
 from bs4 import BeautifulSoup
@@ -52,18 +54,31 @@ TICK_TYPE_MAP = {
 
 console = Console()
 
+# Use lxml if installed (2-5x faster than html.parser), otherwise fall back
+try:
+    import lxml  # noqa: F401
+    HTML_PARSER = "lxml"
+except ImportError:
+    HTML_PARSER = HTML_PARSER
+
+# Thread-local storage for per-thread HTTP clients
+_thread_local = threading.local()
+
+# Default concurrency for route scraping within a crag
+DEFAULT_WORKERS = 8
+
 
 def _parse_grade_code(code: str) -> str | None:
-    """Parse 27crags grade code like '5006B' → '6B', '7007A' → '7A'.
+    """Parse 27crags grade code like '5006B' → '6B', '7007A' → '7A', '80008A' → '8A'.
 
-    The code is a numeric sort key followed by the display grade.
-    Strip leading digits that form the sort prefix.
+    The code is a numeric sort prefix followed by the display grade.
+    The grade always starts with a digit followed by a letter (e.g. 6B, 7A+, 8A).
+    We find that boundary to split prefix from grade.
     """
     if not code:
         return None
-    # The pattern is: 3-digit sort prefix + display grade
-    # e.g. 700 + "7A", 500 + "6B", 400 + "6A"
-    match = re.match(r'^\d{3}(.+)$', code)
+    # Find a digit followed by a letter — that's where the grade starts
+    match = re.search(r'(\d[A-Za-z].*)$', code)
     if match:
         return match.group(1)
     # If it already looks like a grade, return as-is
@@ -85,7 +100,15 @@ def _make_client() -> httpx.Client:
         headers=HEADERS,
         follow_redirects=True,
         timeout=30.0,
+        limits=httpx.Limits(max_connections=DEFAULT_WORKERS + 2, max_keepalive_connections=DEFAULT_WORKERS),
     )
+
+
+def _get_thread_client() -> httpx.Client:
+    """Get or create a per-thread HTTP client (for thread-pool workers)."""
+    if not hasattr(_thread_local, "client"):
+        _thread_local.client = _make_client()
+    return _thread_local.client
 
 
 def _get(client: httpx.Client, url: str) -> httpx.Response:
@@ -134,7 +157,7 @@ def fetch_all_crags(client: httpx.Client) -> list[dict]:
 
     # Fallback: parse the page HTML for crag links
     console.print("  [yellow]No embedded JSON found, parsing crag links from HTML...[/yellow]")
-    soup = BeautifulSoup(text, "html.parser")
+    soup = BeautifulSoup(text, HTML_PARSER)
     crags = []
     for link in soup.select('a[href*="/crags/"]'):
         href = link.get("href", "")
@@ -215,7 +238,7 @@ def scrape_routelist(client: httpx.Client, crag_slug: str) -> list[dict]:
         console.print(f"  [red]Failed to fetch routelist for {crag_slug}[/red]")
         return []
 
-    soup = BeautifulSoup(resp.text, "html.parser")
+    soup = BeautifulSoup(resp.text, HTML_PARSER)
     routes = []
 
     # Route list table: columns are [name/info, grade_code, type, ascents, rating, ...]
@@ -266,7 +289,7 @@ def scrape_routelist(client: httpx.Client, crag_slug: str) -> list[dict]:
 
 def _parse_ascent_html(html: str, crag_slug: str, route_slug: str, route_name: str, grade: str | None) -> list[dict]:
     """Parse ascent rows from HTML (works for both route page and /more endpoint)."""
-    soup = BeautifulSoup(html, "html.parser")
+    soup = BeautifulSoup(html, HTML_PARSER)
     ascents = []
 
     # Look for ascent rows — multiple possible structures
@@ -373,10 +396,38 @@ def scrape_route_ascents(client: httpx.Client, crag_slug: str, route_slug: str,
 # Main entry point
 # ---------------------------------------------------------------------------
 
+def _scrape_route_worker(crag_slug: str, route: dict) -> list[dict]:
+    """Thread-pool worker: fetch ascents for one route using a per-thread client."""
+    client = _get_thread_client()
+    _polite_sleep(0.1, 1)  # stagger requests across threads
+    return scrape_route_ascents(client, crag_slug, route["slug"], route["name"], route["grade"])
+
+
+def _batch_insert_ascents(conn, ascents: list[dict]):
+    """Batch-insert ascents and their climbers in bulk."""
+    if not ascents:
+        return
+    # Bulk upsert climbers
+    conn.executemany(
+        "INSERT OR IGNORE INTO climbers (username) VALUES (?)",
+        [(a["username"],) for a in ascents],
+    )
+    # Bulk insert ascents
+    conn.executemany(
+        """INSERT OR IGNORE INTO ascents (climber, route_id, route_name, grade, tick_type, date)
+           VALUES (?, ?, ?, ?, ?, ?)""",
+        [
+            (a["username"], a["route_id"], a["route_name"], a["grade"], a["tick_type"], a["date"])
+            for a in ascents
+        ],
+    )
+
+
 def scrape(
     crag_slugs: list[str] | None = None,
     min_boulders: int = 50,
     max_crags: int = 10,
+    workers: int = DEFAULT_WORKERS,
     debug: bool = False,
 ):
     """Main scrape function.
@@ -385,6 +436,7 @@ def scrape(
         crag_slugs: Specific crag slugs to scrape. If None, auto-discover.
         min_boulders: Minimum boulder count to include a crag (for auto-discover).
         max_crags: Maximum number of crags to scrape (for auto-discover).
+        workers: Number of threads for parallel route scraping.
         debug: Print extra debug info.
     """
     conn = get_connection()
@@ -408,7 +460,7 @@ def scrape(
     else:
         console.print(f"Scraping [green]{len(crag_slugs)}[/green] specified crags")
 
-    # Step 2: For each crag, scrape routes and ascents
+    # Step 2: For each crag, scrape routes and ascents (routes in parallel)
     total_routes = 0
     total_ascents = 0
 
@@ -430,7 +482,7 @@ def scrape(
 
             progress.update(crag_task, description=f"Crag [cyan]{crag_slug}[/cyan]")
 
-            # Fetch route list
+            # Fetch route list (single request, not parallelized)
             try:
                 routes = scrape_routelist(client, crag_slug)
             except Exception as e:
@@ -443,35 +495,38 @@ def scrape(
                 _polite_sleep()
                 continue
 
-            # Store routes and scrape ascents
+            # Bulk upsert routes
+            conn.executemany(
+                """INSERT INTO routes (route_id, name, grade) VALUES (?, ?, ?)
+                   ON CONFLICT(route_id) DO UPDATE SET
+                       name = COALESCE(excluded.name, routes.name),
+                       grade = COALESCE(excluded.grade, routes.grade)""",
+                [(f"27c:{crag_slug}/{r['slug']}", r["name"], r["grade"]) for r in routes],
+            )
+
+            # Scrape ascents in parallel using thread pool
             crag_ascent_count = 0
             route_task = progress.add_task(f"  Routes in {crag_slug}", total=len(routes))
+            all_ascents = []
 
-            for j, route in enumerate(routes):
-                route_id = f"27c:{crag_slug}/{route['slug']}"
-                upsert_route(conn, route_id, route["name"], route["grade"])
+            with ThreadPoolExecutor(max_workers=workers) as pool:
+                future_to_route = {
+                    pool.submit(_scrape_route_worker, crag_slug, route): route
+                    for route in routes
+                }
 
-                try:
-                    ascents = scrape_route_ascents(
-                        client, crag_slug, route["slug"], route["name"], route["grade"]
-                    )
-                except Exception as e:
-                    console.print(f"    [red]Failed to fetch ascents for {route['name']}:[/red] {e}")
-                    continue
+                for future in as_completed(future_to_route):
+                    route = future_to_route[future]
+                    try:
+                        ascents = future.result()
+                        all_ascents.extend(ascents)
+                        crag_ascent_count += len(ascents)
+                    except Exception as e:
+                        console.print(f"    [red]Failed to fetch ascents for {route['name']}:[/red] {e}")
+                    progress.update(route_task, advance=1)
 
-                for a in ascents:
-                    upsert_climber(conn, a["username"])
-                    insert_ascent(
-                        conn, a["username"], a["route_id"],
-                        a["route_name"], a["grade"], a["tick_type"], a["date"],
-                    )
-                    crag_ascent_count += 1
-
-                # Be polite — don't hammer the server
-                if j % 10 == 9:
-                    conn.commit()
-                _polite_sleep(0.5, 1.5)
-                progress.update(route_task, advance=1)
+            # Batch write all ascents for this crag at once
+            _batch_insert_ascents(conn, all_ascents)
 
             # Remove the per-crag route task once done
             progress.remove_task(route_task)
@@ -481,7 +536,7 @@ def scrape(
             total_routes += len(routes)
             total_ascents += crag_ascent_count
             progress.update(crag_task, advance=1)
-            _polite_sleep(2.0, 4.0)
+            _polite_sleep(1.0, 2.0)
 
     client.close()
 

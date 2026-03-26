@@ -19,8 +19,9 @@ def main():
 @click.option("--crags", default=None, help="Comma-separated crag slugs (e.g. fontainebleau,magic-wood-15945)")
 @click.option("--max-crags", default=10, help="Max crags to auto-discover if none specified")
 @click.option("--min-boulders", default=50, help="Min boulder count for auto-discovery")
+@click.option("--workers", default=6, help="Number of threads for parallel route scraping")
 @click.option("--debug", is_flag=True, help="Extra debug output")
-def scrape(crags, max_crags, min_boulders, debug):
+def scrape(crags, max_crags, min_boulders, workers, debug):
     """Scrape climbing data from 27crags.com."""
     crag_slugs = None
     if crags:
@@ -30,6 +31,7 @@ def scrape(crags, max_crags, min_boulders, debug):
         crag_slugs=crag_slugs,
         max_crags=max_crags,
         min_boulders=min_boulders,
+        workers=workers,
         debug=debug,
     )
 
